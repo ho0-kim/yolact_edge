@@ -83,8 +83,6 @@ def make_net(in_channels, conf, include_last_relu=True):
 
     return nn.Sequential(*(net)), in_channels
 
-
-
 class Bottleneck(nn.Module):
     """ Adapted from torchvision.models.resnet """
     expansion = 4
@@ -430,6 +428,349 @@ class FPN(ScriptModuleWrapper):
 
         return out
 
+class PredictionModule(nn.Module):
+    """
+    The (c) prediction module adapted from DSSD:
+    https://arxiv.org/pdf/1701.06659.pdf
+
+    Note that this is slightly different to the module in the paper
+    because the Bottleneck block actually has a 3x3 convolution in
+    the middle instead of a 1x1 convolution. Though, I really can't
+    be arsed to implement it myself, and, who knows, this might be
+    better.
+
+    Args:
+        - in_channels:   The input feature size.
+        - out_channels:  The output feature size (must be a multiple of 4).
+        - aspect_ratios: A list of lists of priorbox aspect ratios (one list per scale).
+        - scales:        A list of priorbox scales relative to this layer's convsize.
+                         For instance: If this layer has convouts of size 30x30 for
+                                       an image of size 600x600, the 'default' (scale
+                                       of 1) for this layer would produce bounding
+                                       boxes with an area of 20x20px. If the scale is
+                                       .5 on the other hand, this layer would consider
+                                       bounding boxes with area 10x10px, etc.
+        - parent:        If parent is a PredictionModule, this module will use all the layers
+                         from parent instead of from this module.
+    """
+    
+    def __init__(self, in_channels, out_channels=1024, aspect_ratios=[[1]], scales=[1], parent=None, index=0, mask_dim=None, num_classes=81):
+        super().__init__()
+
+        self.params = [in_channels, out_channels, aspect_ratios, scales, parent, index]
+
+        self.num_classes = num_classes
+        self.mask_dim    = mask_dim
+        self.num_priors  = sum(len(x) for x in aspect_ratios)
+        self.parent      = [parent] # Don't include this in the state dict
+        self.index       = index
+
+        self.extra_head_net = [(256, 3, {'padding': 1})]
+        self.head_layer_params = {'kernel_size': 3, 'padding': 1}
+        self.num_instance_coeffs = 64
+
+        if parent is None:
+            if self.extra_head_net is None:
+                out_channels = in_channels
+            else:
+                self.upfeature, out_channels = make_net(in_channels, self.extra_head_net)
+
+            self.bbox_layer = nn.Conv2d(out_channels, self.num_priors * 4,                **(self.head_layer_params))
+            self.conf_layer = nn.Conv2d(out_channels, self.num_priors * self.num_classes, **(self.head_layer_params))
+            self.mask_layer = nn.Conv2d(out_channels, self.num_priors * self.mask_dim,    **(self.head_layer_params))
+            
+            # What is this ugly lambda doing in the middle of all this clean prediction module code?
+            def make_extra(num_layers):
+                if num_layers == 0:
+                    return lambda x: x
+                else:
+                    # Looks more complicated than it is. This just creates an array of num_layers alternating conv-relu
+                    return nn.Sequential(*sum([[
+                        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                        nn.ReLU(inplace=True)
+                    ] for _ in range(num_layers)], []))
+            extra_layers = (0, 0, 0)
+            self.bbox_extra, self.conf_extra, self.mask_extra = [make_extra(x) for x in extra_layers]
+
+        self.aspect_ratios = aspect_ratios
+        self.scales = scales
+
+        self.priors = None
+        self.last_conv_size = None
+
+    def forward(self, x):
+        """
+        Args:
+            - x: The convOut from a layer in the backbone network
+                 Size: [batch_size, in_channels, conv_h, conv_w])
+
+        Returns a tuple (bbox_coords, class_confs, mask_output, prior_boxes) with sizes
+            - bbox_coords: [batch_size, conv_h*conv_w*num_priors, 4]
+            - class_confs: [batch_size, conv_h*conv_w*num_priors, num_classes]
+            - mask_output: [batch_size, conv_h*conv_w*num_priors, mask_dim]
+            - prior_boxes: [conv_h*conv_w*num_priors, 4]
+        """
+        # In case we want to use another module's layers
+        src = self if self.parent[0] is None else self.parent[0]
+        
+        conv_h = x.size(2)
+        conv_w = x.size(3)
+        
+        if self.extra_head_net is not None:
+            x = src.upfeature(x)
+
+        bbox_x = src.bbox_extra(x)
+        conf_x = src.conf_extra(x)
+        mask_x = src.mask_extra(x)
+
+        bbox = src.bbox_layer(bbox_x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, 4)
+        conf = src.conf_layer(conf_x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, self.num_classes)
+
+        mask = src.mask_layer(mask_x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, self.mask_dim)
+
+        mask = torch.tanh(mask)
+        
+        priors = self.make_priors(conv_h, conv_w)
+
+        preds = { 'loc': bbox, 'conf': conf, 'mask': mask, 'priors': priors }
+        
+        return preds
+
+class Detect(object):
+    """At test time, Detect is the final layer of SSD.  Decode location preds,
+    apply non-maximum suppression to location predictions based on conf
+    scores and threshold to a top_k number of output predictions for both
+    confidence score and locations, as the predicted masks.
+    """
+    # TODO: Refactor this whole class away. It needs to go.
+
+    def __init__(self, num_classes, bkg_label, top_k, conf_thresh, nms_thresh):
+        self.num_classes = num_classes
+        self.background_label = bkg_label
+        self.top_k = top_k
+        # Parameters used in nms.
+        self.nms_thresh = nms_thresh
+        if nms_thresh <= 0:
+            raise ValueError('nms_threshold must be non negative.')
+        self.conf_thresh = conf_thresh
+        
+        self.cross_class_nms = False
+        self.use_fast_nms = False
+
+    def __call__(self, predictions, extras=None):
+        """
+        Args:
+             loc_data: (tensor) Loc preds from loc layers
+                Shape: [batch, num_priors, 4]
+            conf_data: (tensor) Shape: Conf preds from conf layers
+                Shape: [batch, num_priors, num_classes]
+            mask_data: (tensor) Mask preds from mask layers
+                Shape: [batch, num_priors, mask_dim]
+            prior_data: (tensor) Prior boxes and variances from priorbox layers
+                Shape: [num_priors, 4]
+            proto_data: (tensor) If using mask_type.lincomb, the prototype masks
+                Shape: [batch, mask_h, mask_w, mask_dim]
+        
+        Returns:
+            output of shape (batch_size, top_k, 1 + 1 + 4 + mask_dim)
+            These outputs are in the order: class idx, confidence, bbox coords, and mask.
+
+            Note that the outputs are sorted only if cross_class_nms is False
+        """
+
+        loc_data   = predictions['loc']
+        conf_data  = predictions['conf']
+        mask_data  = predictions['mask']
+        prior_data = predictions['priors']
+
+        proto_data = predictions['proto'] if 'proto' in predictions else None
+        inst_data  = predictions['inst']  if 'inst'  in predictions else None
+
+        out = []
+
+        with timer.env('Detect'):
+            batch_size = loc_data.size(0)
+            num_priors = prior_data.size(0)
+
+            conf_preds = conf_data.view(batch_size, num_priors, self.num_classes).transpose(2, 1).contiguous()
+
+            for batch_idx in range(batch_size):
+                decoded_boxes = decode(loc_data[batch_idx], prior_data)
+                result = self.detect(batch_idx, conf_preds, decoded_boxes, mask_data, inst_data, extras)
+
+                if result is not None and proto_data is not None:
+                    result['proto'] = proto_data[batch_idx]
+                
+                out.append(result)
+        
+        return out
+
+
+    def detect(self, batch_idx, conf_preds, decoded_boxes, mask_data, inst_data, extras=None):
+        """ Perform nms for only the max scoring class that isn't background (class 0) """
+        cur_scores = conf_preds[batch_idx, 1:, :]
+        conf_scores, _ = torch.max(cur_scores, dim=0)
+
+        keep = (conf_scores > self.conf_thresh)
+        scores = cur_scores[:, keep]
+        boxes = decoded_boxes[keep, :]
+        masks = mask_data[batch_idx, keep, :]
+
+        if inst_data is not None:
+            inst = inst_data[batch_idx, keep, :]
+    
+        if scores.size(1) == 0:
+            return None
+        
+        if self.use_fast_nms:
+            boxes, masks, classes, scores = self.fast_nms(boxes, masks, scores, self.nms_thresh, self.top_k)
+        else:
+            boxes, masks, classes, scores = self.traditional_nms(boxes, masks, scores, self.nms_thresh, self.conf_thresh)
+
+        return {'box': boxes, 'mask': masks, 'class': classes, 'score': scores}
+    
+
+    def coefficient_nms(self, coeffs, scores, cos_threshold=0.9, top_k=400):
+        _, idx = scores.sort(0, descending=True)
+        idx = idx[:top_k]
+        coeffs_norm = F.normalize(coeffs[idx], dim=1)
+
+        # Compute the pairwise cosine similarity between the coefficients
+        cos_similarity = coeffs_norm @ coeffs_norm.t()
+        
+        # Zero out the lower triangle of the cosine similarity matrix and diagonal
+        cos_similarity.triu_(diagonal=1)
+
+        # Now that everything in the diagonal and below is zeroed out, if we take the max
+        # of the cos similarity matrix along the columns, each column will represent the
+        # maximum cosine similarity between this element and every element with a higher
+        # score than this element.
+        cos_max, _ = torch.max(cos_similarity, dim=0)
+
+        # Now just filter out the ones higher than the threshold
+        idx_out = idx[cos_max <= cos_threshold]
+
+
+        # new_mask_norm = F.normalize(masks[idx_out], dim=1)
+        # print(new_mask_norm[:5] @ new_mask_norm[:5].t())
+        
+        return idx_out, idx_out.size(0)
+
+    def fast_nms(self, boxes, masks, scores, iou_threshold:float=0.5, top_k:int=200, second_threshold:bool=False):
+        scores, idx = scores.sort(1, descending=True)
+
+        idx = idx[:, :top_k].contiguous()
+        scores = scores[:, :top_k]
+    
+        num_classes, num_dets = idx.size()
+
+        boxes = boxes[idx.view(-1), :].view(num_classes, num_dets, 4)
+        masks = masks[idx.view(-1), :].view(num_classes, num_dets, -1)
+
+        iou = jaccard(boxes, boxes)
+        iou.triu_(diagonal=1)
+        iou_max, _ = iou.max(dim=1)
+
+        # Now just filter out the ones higher than the threshold
+        keep = (iou_max <= iou_threshold)
+
+        # We should also only keep detections over the confidence threshold, but at the cost of
+        # maxing out your detection count for every image, you can just not do that. Because we
+        # have such a minimal amount of computation per detection (matrix mulitplication only),
+        # this increase doesn't affect us much (+0.2 mAP for 34 -> 33 fps), so we leave it out.
+        # However, when you implement this in your method, you should do this second threshold.
+        if second_threshold:
+            keep *= (scores > self.conf_thresh)
+
+        # Assign each kept detection to its corresponding class
+        classes = torch.arange(num_classes, device=boxes.device)[:, None].expand_as(keep)
+
+        # This try-except block aims to fix the IndexError that we might encounter when we train on custom datasets and evaluate with TensorRT enabled. See https://github.com/haotian-liu/yolact_edge/issues/27.
+        try:
+            classes = classes[keep]
+        except IndexError:
+
+            import logging
+            logger = logging.getLogger("yolact.layers.detect")
+            logger.warning("Encountered IndexError as mentioned in https://github.com/haotian-liu/yolact_edge/issues/27. Flattening predictions to avoid error, please verify the outputs. If there are any problems you met related to this, please report an issue.")
+
+            classes = torch.flatten(classes, end_dim=1)
+            boxes = torch.flatten(boxes, end_dim=1)
+            masks = torch.flatten(masks, end_dim=1)
+            scores = torch.flatten(scores, end_dim=1)
+            keep = torch.flatten(keep, end_dim=1)
+
+            classes = classes[keep]
+
+        boxes = boxes[keep]
+        masks = masks[keep]
+        scores = scores[keep]
+        
+        # Only keep the top cfg.max_num_detections highest scores across all classes
+        scores, idx = scores.sort(0, descending=True)
+        idx = idx[:cfg.max_num_detections]
+        scores = scores[:cfg.max_num_detections]
+
+        try:
+            classes = classes[idx]
+            boxes = boxes[idx]
+            masks = masks[idx]
+        except IndexError:
+
+            import logging
+            logger = logging.getLogger("yolact.layers.detect")
+            logger.warning("Encountered IndexError as mentioned in https://github.com/haotian-liu/yolact_edge/issues/27. Using `torch.index_select` to avoid error, please verify the outputs. If there are any problems you met related to this, please report an issue.")
+
+            classes = torch.index_select(classes, 0, idx)
+            boxes = torch.index_select(boxes, 0, idx)
+            masks = torch.index_select(masks, 0, idx)
+
+        return boxes, masks, classes, scores
+
+    def traditional_nms(self, boxes, masks, scores, iou_threshold=0.5, conf_thresh=0.05):
+        num_classes = scores.size(0)
+
+        idx_lst = []
+        cls_lst = []
+        scr_lst = []
+
+        # Multiplying by max_size is necessary because of how cnms computes its area and intersections
+        boxes = boxes * cfg.max_size
+
+        for _cls in range(num_classes):
+            cls_scores = scores[_cls, :]
+            conf_mask = cls_scores > conf_thresh
+            idx = torch.arange(cls_scores.size(0), device=boxes.device)
+
+            cls_scores = cls_scores[conf_mask]
+            idx = idx[conf_mask]
+
+            if cls_scores.size(0) == 0:
+                continue
+            
+            preds = torch.cat([boxes[conf_mask], cls_scores[:, None]], dim=1).cpu().numpy()
+            keep = cnms(preds, iou_threshold)
+            keep = torch.Tensor(keep, device=boxes.device).long()
+
+            idx_lst.append(idx[keep])
+            cls_lst.append(keep * 0 + _cls)
+            scr_lst.append(cls_scores[keep])
+        
+        idx     = torch.cat(idx_lst, dim=0)
+        classes = torch.cat(cls_lst, dim=0)
+        scores  = torch.cat(scr_lst, dim=0)
+
+        scores, idx2 = scores.sort(0, descending=True)
+        idx2 = idx2[:cfg.max_num_detections]
+        scores = scores[:cfg.max_num_detections]
+
+        idx = idx[idx2]
+        classes = classes[idx2]
+
+        # Undo the multiplication above
+        return boxes[idx] / cfg.max_size, masks[idx], classes, scores
+
+
 class yolactedge(nn.Module):
     def __init__(self, training=False):
         super().__init__()
@@ -446,6 +787,8 @@ class yolactedge(nn.Module):
         self.num_grids = 0
 
         self.proto_src = 0
+
+        self.num_classes = 81
         
         in_channels = self.fpn_num_features
         in_channels += self.num_grids
@@ -463,6 +806,31 @@ class yolactedge(nn.Module):
         self.selected_layers = list(range(len(self.selected_layers) + 2))
 
         src_channels = [self.fpn_num_features] * len(self.selected_layers)
+
+        self.prediction_layers = nn.ModuleList()
+
+        for idx, layer_idx in enumerate(self.selected_layers):
+            # If we're sharing prediction module weights, have every module's parent be the first one
+            parent = None
+            if idx > 0:
+                parent = self.prediction_layers[0]
+
+            pred_aspect_ratios = [ [[1, 1/2, 2]] ]*5
+            pred_scales = [[24], [48], [96], [192], [384]]
+
+            pred = PredictionModule(src_channels[layer_idx], src_channels[layer_idx],
+                                    aspect_ratios = pred_aspect_ratios[idx],
+                                    scales        = pred_scales[idx],
+                                    parent        = parent,
+                                    index         = idx,
+                                    mask_dim      = self.mask_dim,
+                                    num_classes   = self.num_classes)
+            self.prediction_layers.append(pred)
+
+        self.semantic_seg_conv = nn.Conv2d(src_channels[0], self.num_classes-1, kernel_size=1)
+
+        # # For use in evaluation
+        # self.detect = Detect(self.num_classes, bkg_label=0, top_k=200, conf_thresh=0.05, nms_thresh=0.5)
 
     def forward(self, inp):
         return inp
